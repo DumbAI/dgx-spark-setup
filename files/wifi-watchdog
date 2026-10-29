@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Probe the Wi-Fi gateway; escalate repairs on consecutive failures.
+# Installed by modules/40-wifi-watchdog.sh and run every minute by its timer.
+#
+# The mt7925e driver can wedge after a link drop (seen 2026-10-21): the radio
+# stops scanning, NetworkManager never retries, and the host stays offline
+# until someone reboots it. Escalation by consecutive failed probes:
+#   fail #2       -> rescan and reconnect
+#   fail #4       -> reload the driver, reconnect
+#   fail #8,12,.. -> reboot (at most once per REBOOT_MIN_INTERVAL), else reload driver
+set -u
+# shellcheck source=/dev/null
+source /etc/default/wifi-watchdog
+
+FAILS_FILE=/run/wifi-watchdog.fails                 # tmpfs: resets on every boot
+LAST_REBOOT_FILE=/var/lib/wifi-watchdog/last-reboot # persists across boots
+log() { logger -t wifi-watchdog "$*"; }
+
+gw=$(ip -4 route show default dev "$IFACE" 2>/dev/null | awk '{print $3; exit}')
+if [[ -n $gw ]] && ping -c3 -W2 -I "$IFACE" "$gw" >/dev/null 2>&1; then
+    [[ -s $FAILS_FILE && $(cat "$FAILS_FILE") != 0 ]] && log "link healthy again"
+    echo 0 >"$FAILS_FILE"
+    exit 0
+fi
+
+fails=$(( $(cat "$FAILS_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$fails" >"$FAILS_FILE"
+log "gateway ${gw:-<no default route>} unreachable on $IFACE (fail #$fails)"
+
+reconnect() {
+    nmcli radio wifi on
+    nmcli device wifi rescan ifname "$IFACE" 2>/dev/null
+    sleep 5
+    nmcli connection up "$CONN" ifname "$IFACE" && log "reconnected $CONN"
+}
+
+reload_driver() {
+    log "reloading $DRIVER"
+    modprobe -r "$DRIVER" && sleep 3 && modprobe "$DRIVER" && sleep 10
+    reconnect
+}
+
+reboot_allowed() {
+    local last now
+    last=$(cat "$LAST_REBOOT_FILE" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    (( now - last >= REBOOT_MIN_INTERVAL ))
+}
+
+if (( fails == 2 )); then
+    reconnect
+elif (( fails == 4 )); then
+    reload_driver
+elif (( fails >= 8 && fails % 4 == 0 )); then
+    if reboot_allowed; then
+        mkdir -p "$(dirname "$LAST_REBOOT_FILE")"
+        date +%s >"$LAST_REBOOT_FILE"
+        log "repairs failed, rebooting"
+        systemctl reboot
+    else
+        reload_driver
+    fi
+fi
