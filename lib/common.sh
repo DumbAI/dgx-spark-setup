@@ -26,6 +26,14 @@ run() {
     fi
 }
 
+# Print "DEVICE CONNECTION" for the active NetworkManager Wi-Fi connection.
+# Prints nothing, and still succeeds, on hosts without one.
+active_wifi() {
+    command -v nmcli >/dev/null || return 0
+    nmcli -t -f DEVICE,TYPE,CONNECTION device status 2>/dev/null \
+        | awk -F: '$2 == "wifi" && $3 != "" { print $1, $3; exit }' || true
+}
+
 install_config() {
     if "$SETUP_DRY_RUN"; then
         printf '\nConfiguration for %s:\n' "$2"
